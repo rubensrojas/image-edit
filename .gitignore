@@ -1,0 +1,16 @@
+.DS_Store
+.envrc
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+release/
+input/
+output/
+output.zip
+test.jpeg
+*.dmg
+*.exe
+*.msi

@@ -1,0 +1,68 @@
+name: Test and build desktop apps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: SRE-Image-Editor-Windows-x64
+            kind: windows
+          - os: macos-15
+            artifact: SRE-Image-Editor-macOS-arm64
+            kind: macos
+          - os: macos-15-intel
+            artifact: SRE-Image-Editor-macOS-x64
+            kind: macos
+    runs-on: ${{ matrix.os }}
+    env:
+      TESSERACT_BUNDLE_DIR: ${{ github.workspace }}/build/tesseract
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - if: matrix.kind == 'windows'
+        run: choco install tesseract --yes --no-progress
+      - if: matrix.kind == 'macos'
+        run: brew install tesseract
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - run: python scripts/create_icons.py
+      - run: python scripts/stage_tesseract.py
+      - run: pyinstaller --noconfirm --clean SREImageEditor.spec
+      - if: matrix.kind == 'windows'
+        shell: pwsh
+        run: '& "dist/SRE Image Editor/SRE Image Editor.exe" --smoke-test'
+      - if: matrix.kind == 'macos'
+        run: '"dist/SRE Image Editor.app/Contents/MacOS/SRE Image Editor" --smoke-test'
+      - if: matrix.kind == 'windows'
+        shell: pwsh
+        run: '& "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" installer/windows.iss'
+      - if: matrix.kind == 'macos'
+        run: sh scripts/create_dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
