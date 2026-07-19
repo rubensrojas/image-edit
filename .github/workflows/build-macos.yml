@@ -1,0 +1,61 @@
+name: Build macOS Apple Silicon installer
+run-name: Build macOS Apple Silicon installer by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-macos-apple-silicon
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      TESSERACT_BUNDLE_DIR: ${{ github.workspace }}/build/tesseract
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Tesseract
+        run: brew install tesseract
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Prepare icons and Tesseract
+        run: |
+          python scripts/create_icons.py
+          python scripts/stage_tesseract.py
+
+      - name: Build Apple Silicon application
+        run: pyinstaller --noconfirm --clean SREImageEditor.spec
+
+      - name: Verify packaged application
+        run: '"dist/SRE Image Editor.app/Contents/MacOS/SRE Image Editor" --smoke-test'
+
+      - name: Create macOS disk image
+        run: sh scripts/create_dmg.sh
+
+      - name: Upload Apple Silicon installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SRE-Image-Editor-macOS-arm64
+          path: release/SRE-Image-Editor-macOS-arm64.dmg
+          if-no-files-found: error
+          retention-days: 14

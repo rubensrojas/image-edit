@@ -42,7 +42,7 @@ python scripts/stage_tesseract.py
 TESSERACT_BUNDLE_DIR="$PWD/build/tesseract" pyinstaller --clean --noconfirm SREImageEditor.spec
 ```
 
-No macOS, execute `sh scripts/create_dmg.sh`. No Windows, compile `installer/windows.iss` com o Inno Setup 6. Cada versão deve ser gerada em sua própria plataforma: Windows x64, macOS com Apple Silicon e macOS Intel. O GitHub Actions automatiza as três versões.
+No macOS, execute `sh scripts/create_dmg.sh`. No Windows, compile `installer/windows.iss` com o Inno Setup 6. Cada versão deve ser gerada em sua própria plataforma: Windows x64 ou macOS com Apple Silicon. Na aba Actions do GitHub, os workflows manuais **Build Windows installer** e **Build macOS Apple Silicon installer** geram cada instalador separadamente. Macs Intel não são suportados.
 
 ## Executar os testes
 
