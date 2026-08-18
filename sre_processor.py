@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -213,6 +214,17 @@ def read_line_3(img: Image.Image, sre_number: int) -> str:
     raise RuntimeError("Não foi possível ler a linha SRE")
 
 
+def read_raw_line_3(img: Image.Image) -> str:
+    """Read the visible third caption line without changing its content."""
+    line_box = detect_line_3_box(img)
+    crop = img.crop(line_box)
+    return re.sub(
+        r"\s+",
+        " ",
+        pytesseract.image_to_string(crop, config="--psm 7").strip(),
+    )
+
+
 def sample_subtitle_background(line_crop: Image.Image) -> tuple[int, int, int]:
     pixels = line_crop.load()
     width, height = line_crop.size
@@ -308,15 +320,52 @@ def fit_font_size(
     return best_size
 
 
+def source_font_size(
+    line_size: tuple[int, int], target_bounds: Optional[tuple[int, int]]
+) -> int:
+    """Estimate the original point size without adapting it to replacement width."""
+    _, height = line_size
+    scale = height / (LINE_3_BAND[3] - LINE_3_BAND[1])
+    target_height = target_bounds[1] if target_bounds else round(37 * scale)
+    reference = "MT - 010 SRE 010EMT0415"
+    best_size = max(12, round(50 * scale))
+    best_difference = float("inf")
+
+    for size in range(max(12, round(32 * scale)), max(13, round(72 * scale)) + 1):
+        bbox = find_font(size).getbbox(reference)
+        difference = abs((bbox[3] - bbox[1]) - target_height)
+        if difference < best_difference:
+            best_difference = difference
+            best_size = size
+    return best_size
+
+
+def text_fits_line(
+    text: str,
+    line_size: tuple[int, int],
+    target_bounds: Optional[tuple[int, int]],
+) -> bool:
+    """Return whether full-line text fits at the source line's font size."""
+    width, height = line_size
+    scale = height / (LINE_3_BAND[3] - LINE_3_BAND[1])
+    horizontal_padding = max(8, round(12 * scale))
+    font = find_font(source_font_size(line_size, target_bounds))
+    bbox = font.getbbox(text)
+    return bbox[2] - bbox[0] <= width - horizontal_padding
+
+
 def draw_replacement_line(
     img: Image.Image,
     line_box: tuple[int, int, int, int],
     text: str,
     target_bounds: Optional[tuple[int, int]] = None,
+    fixed_font_size: Optional[int] = None,
 ) -> None:
     x1, y1, x2, y2 = line_box
     line_width, line_height = x2 - x1, y2 - y1
-    font_size = fit_font_size(text, (line_width, line_height), target_bounds)
+    font_size = fixed_font_size or fit_font_size(
+        text, (line_width, line_height), target_bounds
+    )
 
     # Render large and downsample for smoother edges than direct bitmap text.
     supersample = 4
@@ -338,21 +387,87 @@ def draw_replacement_line(
     img.paste(layer, (x1, y1), layer)
 
 
-def edit_image(
-    input_path: Path, output_path: Path, sre_number: int = 10
-) -> None:
+def render_edited_image(
+    input_path: Path,
+    sre_number: int = 10,
+    *,
+    full_line_text: Optional[str] = None,
+) -> Image.Image:
     format_sre_number(sre_number)
     with Image.open(input_path) as source:
         img = source.convert("RGB")
-    replacement = read_line_3(img, sre_number)
+
+    if full_line_text is None:
+        replacement = read_line_3(img, sre_number)
+    else:
+        replacement = full_line_text.strip()
+        if not replacement:
+            raise ValueError("Digite o texto da terceira linha")
+        if "\n" in replacement or "\r" in replacement:
+            raise ValueError("A terceira linha não pode conter uma quebra de linha")
+
     line_box = detect_line_3_box(img)
     target_bounds = measure_text_bounds(img.crop(line_box))
+    line_size = (line_box[2] - line_box[0], line_box[3] - line_box[1])
+    fixed_font_size: Optional[int] = None
+    if full_line_text is not None:
+        if not text_fits_line(replacement, line_size, target_bounds):
+            raise ValueError(
+                "O texto é longo demais para a terceira linha. Encurte-o para continuar."
+            )
+        fixed_font_size = source_font_size(line_size, target_bounds)
+
     erase_old_line_text(img, line_box)
-    draw_replacement_line(img, line_box, replacement, target_bounds)
+    draw_replacement_line(
+        img,
+        line_box,
+        replacement,
+        target_bounds,
+        fixed_font_size=fixed_font_size,
+    )
+    return img
+
+
+def encode_edited_image(
+    input_path: Path,
+    sre_number: int = 10,
+    *,
+    full_line_text: Optional[str] = None,
+    output_suffix: Optional[str] = None,
+) -> bytes:
+    """Render and encode one image for both previews and batch output."""
+    img = render_edited_image(
+        input_path,
+        sre_number,
+        full_line_text=full_line_text,
+    )
+    suffix = (output_suffix or input_path.suffix).lower()
+    formats = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
+    image_format = formats.get(suffix)
+    if image_format is None:
+        raise ValueError(f"Formato de saída incompatível: {suffix}")
+    save_options = {"quality": 95} if image_format != "PNG" else {}
+    buffer = BytesIO()
+    img.save(buffer, format=image_format, **save_options)
+    return buffer.getvalue()
+
+
+def edit_image(
+    input_path: Path,
+    output_path: Path,
+    sre_number: int = 10,
+    *,
+    full_line_text: Optional[str] = None,
+) -> None:
+    encoded = encode_edited_image(
+        input_path,
+        sre_number,
+        full_line_text=full_line_text,
+        output_suffix=output_path.suffix,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_options = {"quality": 95} if output_path.suffix.lower() != ".png" else {}
-    img.save(output_path, **save_options)
+    output_path.write_bytes(encoded)
 
 
 def is_supported_file(path: Path) -> bool:

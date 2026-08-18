@@ -10,12 +10,14 @@ import sre_processor
 from sre_processor import (
     collision_safe_path,
     draw_replacement_line,
+    encode_edited_image,
     edit_image,
     fit_font_size,
     format_sre_number,
     measure_text_bounds,
     normalize_numeric_suffix,
     normalize_sre_line,
+    text_fits_line,
     unique_paths,
 )
 
@@ -98,3 +100,56 @@ def test_edit_image_preserves_source_and_output_dimensions(
     with Image.open(output) as result:
         assert result.size == (1200, 1600)
         assert result.format == "JPEG"
+
+
+def test_full_line_is_literal_and_does_not_use_numeric_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1200, 1600), (20, 18, 16)).save(source)
+    captured: dict[str, object] = {}
+
+    def fail_numeric_ocr(*_args: object) -> str:
+        raise AssertionError("numeric OCR must not run in full-line mode")
+
+    def capture_draw(
+        image: Image.Image,
+        box: tuple[int, int, int, int],
+        text: str,
+        target_bounds: object = None,
+        fixed_font_size: int | None = None,
+    ) -> None:
+        captured["text"] = text
+        captured["font_size"] = fixed_font_size
+
+    monkeypatch.setattr(sre_processor, "read_line_3", fail_numeric_ocr)
+    monkeypatch.setattr(sre_processor, "draw_replacement_line", capture_draw)
+
+    encode_edited_image(source, full_line_text="  LINHA ÚNICA  ")
+
+    assert captured["text"] == "LINHA ÚNICA"
+    assert isinstance(captured["font_size"], int)
+
+
+def test_preview_encoding_matches_written_batch_file(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1200, 1600), (20, 18, 16)).save(source)
+    output = tmp_path / "output.png"
+
+    preview = encode_edited_image(source, full_line_text="LINHA COMPLETA")
+    edit_image(source, output, full_line_text="LINHA COMPLETA")
+
+    assert output.read_bytes() == preview
+
+
+def test_full_line_rejects_empty_or_visually_oversized_text(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1200, 1600), (20, 18, 16)).save(source)
+
+    with pytest.raises(ValueError, match="Digite o texto"):
+        encode_edited_image(source, full_line_text="   ")
+    with pytest.raises(ValueError, match="longo demais"):
+        encode_edited_image(source, full_line_text="W" * 80)
+
+    assert text_fits_line("LINHA CURTA", (624, 58), (599, 37))
+    assert not text_fits_line("W" * 80, (624, 58), (599, 37))

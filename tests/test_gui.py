@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import threading
+import zipfile
 from pathlib import Path
 
 from PIL import Image
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QLabel
 
 import app
-from app import BatchWorker, MainWindow, PaddedSpinBox
+from app import (
+    STYLESHEET,
+    AnimatedProgressBar,
+    BatchWorker,
+    ExportWorker,
+    MainWindow,
+    PaddedSpinBox,
+    PreviewImage,
+)
 
 
 def make_image(path: Path) -> Path:
@@ -38,19 +51,60 @@ def test_window_adds_supported_files_and_ignores_duplicates(qtbot, tmp_path: Pat
     assert "incompatível" in window.feedback.text()
 
 
-def test_process_requires_files_and_output(qtbot, tmp_path: Path) -> None:
+def test_selection_step_requires_files_and_full_line_defaults_off(qtbot, tmp_path: Path) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
-    window.output_dir = None
-    window.output_field.clear()
-    window.refresh_state()
-    assert not window.process_button.isEnabled()
+    assert window.pages.currentIndex() == 0
+    assert not window.continue_button.isEnabled()
+    assert not window.full_line_toggle.isChecked()
 
     window.add_files([make_image(tmp_path / "photo.png")])
-    assert not window.process_button.isEnabled()
-    window.set_output_folder(tmp_path / "edited")
-    window.refresh_state()
-    assert window.process_button.isEnabled()
+    assert window.continue_button.isEnabled()
+
+
+def test_window_uses_large_layout_without_global_step_header(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    assert window.size().width() == 1280
+    assert window.size().height() == 960
+    assert window.minimumWidth() == 1040
+    assert window.minimumHeight() == 800
+    assert window.findChildren(QLabel, "stepLabel") == []
+    assert "QLabel#stepLabel" not in STYLESHEET
+    assert "QLabel#previewImage { background: transparent; border: 0" in STYLESHEET
+
+
+def test_preview_preserves_aspect_ratio_and_overlay_matches_image(
+    qtbot, tmp_path: Path
+) -> None:
+    path = tmp_path / "portrait.png"
+    Image.new("RGB", (1200, 1600), "black").save(path)
+    preview = PreviewImage("Prévia", Qt.AlignmentFlag.AlignRight)
+    qtbot.addWidget(preview)
+    preview.resize(600, 600)
+    preview.show()
+    preview.set_source(QPixmap(str(path)))
+    preview.set_loading(True)
+
+    rect = preview.image_rect
+    assert rect.width() / rect.height() == 0.75
+    assert rect.right() == preview.contentsRect().right()
+    assert preview.loading_overlay.geometry() == rect
+    assert preview.is_loading
+
+
+def test_edit_mode_preserves_both_values(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.sre_number.setValue(27)
+    window.full_line_toggle.setChecked(True)
+    window.full_line_input.setText("LINHA PERSONALIZADA")
+    window.full_line_toggle.setChecked(False)
+    window.full_line_toggle.setChecked(True)
+
+    assert window.sre_number.value() == 27
+    assert window.full_line_input.text() == "LINHA PERSONALIZADA"
 
 
 def test_worker_continues_after_an_image_fails(monkeypatch, tmp_path: Path) -> None:
@@ -72,3 +126,169 @@ def test_worker_continues_after_an_image_fails(monkeypatch, tmp_path: Path) -> N
     assert result[0][0] == 1
     assert result[0][1] == [("one.png", "OCR failed")]
     assert (worker.output_dir / "two.png").exists()
+
+
+def test_worker_can_cancel_before_processing(tmp_path: Path) -> None:
+    image = make_image(tmp_path / "one.png")
+    output = tmp_path / "output"
+    output.mkdir()
+    cancel_event = threading.Event()
+    cancel_event.set()
+    worker = BatchWorker([image], output, 27, cancel_event=cancel_event)
+    cancelled = []
+    worker.signals.cancelled.connect(lambda: cancelled.append(True))
+
+    worker.run()
+
+    assert cancelled == [True]
+    assert list(output.iterdir()) == []
+
+
+def test_worker_passes_full_line_only_in_full_line_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    image = make_image(tmp_path / "one.png")
+    output = tmp_path / "output"
+    output.mkdir()
+    received = []
+
+    def fake_edit(
+        input_path: Path,
+        output_path: Path,
+        number: int,
+        *,
+        full_line_text: str | None = None,
+    ) -> None:
+        received.append((input_path, number, full_line_text))
+        output_path.touch()
+
+    monkeypatch.setattr(app, "edit_image", fake_edit)
+    BatchWorker([image], output, 27, full_line_text="LINHA ÚNICA").run()
+
+    assert received == [(image, 27, "LINHA ÚNICA")]
+
+
+def test_stale_preview_result_is_ignored(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.preview_request_id = 4
+    window.preview_valid = False
+
+    window.preview_ready(3, b"not-an-image", "old OCR text")
+
+    assert not window.preview_valid
+    assert not window.raw_line_loaded
+
+
+def test_preview_overlay_survives_stale_result_and_stops_on_active_error(
+    qtbot, tmp_path: Path
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    image = make_image(tmp_path / "photo.png")
+    window.files = [image]
+    window.show_page(1)
+    window.after_preview.set_source(QPixmap(str(image)))
+    window.schedule_preview()
+    window.preview_timer.stop()
+    current_request = window.preview_request_id
+
+    window.preview_ready(current_request - 1, b"stale", "")
+    assert window.after_preview.is_loading
+
+    window.preview_failed(current_request, "OCR failed", "")
+    assert not window.after_preview.is_loading
+
+
+def test_animated_progress_eases_and_supports_reduced_motion(qtbot) -> None:
+    progress = AnimatedProgressBar()
+    qtbot.addWidget(progress)
+    progress.setRange(0, 100)
+    progress.motion_enabled_override = True
+    progress.set_immediate_value(0)
+
+    progress.set_animated_value(75)
+    assert progress.value() < 75
+    qtbot.waitUntil(lambda: progress.value() == 75, timeout=1000)
+
+    progress.motion_enabled_override = False
+    reached = []
+    progress.target_reached.connect(reached.append)
+    progress.set_animated_value(40)
+    assert progress.value() == 40
+    assert reached[-1] == 40
+
+
+def test_result_waits_for_progress_to_reach_100(qtbot, tmp_path: Path) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.files = [make_image(tmp_path / "photo.png")]
+    window.temp_dir = tmp_path / "temporary"
+    window.temp_dir.mkdir()
+    (window.temp_dir / "photo.png").touch()
+    window.processing = True
+    window.progress.motion_enabled_override = True
+    window.progress.set_immediate_value(0)
+    window.show_page(2)
+
+    window.processing_finished(1, [])
+
+    assert window.pages.currentIndex() == 2
+    qtbot.waitUntil(lambda: window.pages.currentIndex() == 3, timeout=1000)
+    assert window.progress.value() == 100
+    window._cleanup_temp_dir()
+
+
+def test_batch_failure_is_transactional_and_selects_problem_files(
+    qtbot, tmp_path: Path
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    good = make_image(tmp_path / "good.png")
+    bad = make_image(tmp_path / "bad.png")
+    window.add_files([good, bad])
+    window.temp_dir = tmp_path / "temporary"
+    window.temp_dir.mkdir()
+    (window.temp_dir / "good.png").touch()
+    window.processing = True
+    window.progress.motion_enabled_override = False
+
+    window.processing_finished(1, [("bad.png", "OCR failed")])
+
+    assert window.pages.currentIndex() == 3
+    assert window.temp_dir is None
+    assert window.export_actions.isHidden()
+    assert not window.review_button.isHidden()
+    window.review_failed_images()
+    assert window.file_list.item(1).isSelected()
+
+
+def test_export_worker_supports_folder_collisions_and_zip(tmp_path: Path) -> None:
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    source = make_image(prepared / "photo.png")
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    make_image(destination / "photo.png")
+
+    folder_worker = ExportWorker([source], "folder", destination)
+    folder_result = []
+    folder_worker.signals.finished.connect(
+        lambda succeeded, location, error: folder_result.append((succeeded, location, error))
+    )
+    folder_worker.run()
+
+    assert folder_result[0][0]
+    assert (destination / "photo (2).png").exists()
+
+    archive_path = tmp_path / "images.zip"
+    zip_worker = ExportWorker([source], "zip", archive_path)
+    zip_result = []
+    zip_worker.signals.finished.connect(
+        lambda succeeded, location, error: zip_result.append((succeeded, location, error))
+    )
+    zip_worker.run()
+
+    assert zip_result[0][0]
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.namelist() == ["photo.png"]
