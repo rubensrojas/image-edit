@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import unicodedata
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Optional
@@ -12,6 +13,8 @@ import pytesseract
 
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_EDITED_FILENAME_BYTES = 200
+_COLLISION_COUNTER_RESERVE_BYTES = 12
 
 # Coordinates are relative to the 1200x1600 source layout.
 REFERENCE_SIZE = (1200, 1600)
@@ -493,14 +496,98 @@ def unique_paths(paths: Iterable[Path]) -> list[Path]:
     return unique
 
 
-def collision_safe_path(output_dir: Path, filename: str) -> Path:
-    candidate = output_dir / filename
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _limit_filename_bytes(filename: str, max_bytes: int) -> str:
+    if len(filename.encode("utf-8")) <= max_bytes:
+        return filename
+    source = Path(filename)
+    extension = source.suffix
+    stem_budget = max_bytes - len(extension.encode("utf-8"))
+    return f"{_truncate_utf8(source.stem, stem_budget)}{extension}"
+
+
+def _full_line_slug(text: str) -> str:
+    ascii_text = (
+        unicodedata.normalize("NFKD", text)
+        .encode("ascii", errors="ignore")
+        .decode("ascii")
+        .lower()
+    )
+    return re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_") or "editada"
+
+
+def edited_filename(
+    filename: str,
+    sre_number: int,
+    *,
+    full_line_text: Optional[str] = None,
+) -> str:
+    """Build a distinct, portable filename for a desktop-app result."""
+    source = Path(filename).name
+    path = Path(source)
+    extension = path.suffix.lower()
+    stem = path.stem
+    filename_budget = MAX_EDITED_FILENAME_BYTES - _COLLISION_COUNTER_RESERVE_BYTES
+    content_budget = filename_budget - len(extension.encode("utf-8"))
+
+    if full_line_text is None:
+        number = format_sre_number(sre_number)
+        base_stem = re.sub(r"(?i)_SRE\d{3}$", "", stem) or stem
+        generated_suffix = f"_SRE{number}"
+        stem_budget = content_budget - len(generated_suffix.encode("utf-8"))
+        fitted_stem = _truncate_utf8(base_stem, stem_budget)
+        return f"{fitted_stem}{generated_suffix}{extension}"
+
+    slug = _full_line_slug(full_line_text)
+    separator_bytes = len("_".encode("utf-8"))
+    slug_budget = content_budget - len(stem.encode("utf-8")) - separator_bytes
+    if slug_budget >= 1:
+        fitted_stem = stem
+        fitted_slug = _truncate_utf8(slug, slug_budget).rstrip("_")
+    else:
+        fitted_slug = slug[0]
+        stem_budget = content_budget - separator_bytes - len(
+            fitted_slug.encode("utf-8")
+        )
+        fitted_stem = _truncate_utf8(stem, stem_budget)
+    return f"{fitted_stem}_{fitted_slug}{extension}"
+
+
+def collision_safe_path(
+    output_dir: Path,
+    filename: str,
+    *,
+    max_filename_bytes: Optional[int] = None,
+) -> Path:
+    safe_filename = (
+        _limit_filename_bytes(filename, max_filename_bytes)
+        if max_filename_bytes is not None
+        else filename
+    )
+    candidate = output_dir / safe_filename
     if not candidate.exists():
         return candidate
-    source = Path(filename)
+    source = Path(safe_filename)
     counter = 2
     while True:
-        candidate = output_dir / f"{source.stem} ({counter}){source.suffix}"
+        counter_suffix = f" ({counter})"
+        stem = source.stem
+        if max_filename_bytes is not None:
+            stem_budget = (
+                max_filename_bytes
+                - len(counter_suffix.encode("utf-8"))
+                - len(source.suffix.encode("utf-8"))
+            )
+            stem = _truncate_utf8(stem, stem_budget)
+        candidate = output_dir / f"{stem}{counter_suffix}{source.suffix}"
         if not candidate.exists():
             return candidate
         counter += 1

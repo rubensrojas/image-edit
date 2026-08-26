@@ -12,6 +12,8 @@ Um aplicativo desktop para editar a terceira linha da legenda de várias imagens
 
 Os originais nunca são alterados. Se qualquer imagem falhar, o lote inteiro é interrompido e a tela de resultado indica quais arquivos precisam ser revisados.
 
+O aplicativo desktop sempre usa um nome diferente para cada resultado. Uma edição numérica transforma, por exemplo, `foto.JPG` em `foto_SRE027.jpg`. No modo **Editar linha completa**, o texto é convertido em um identificador seguro, como `foto_area_1_norte.png`. Se o nome já existir na pasta escolhida, o aplicativo adiciona um contador, como `foto_SRE027 (2).jpg`, sem substituir arquivos existentes. Os mesmos nomes são preservados dentro de arquivos ZIP.
+
 ### Como abrir uma versão não assinada
 
 - **Windows:** se o SmartScreen aparecer, clique em **Mais informações**, confira o nome do aplicativo e escolha **Executar assim mesmo**.

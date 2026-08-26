@@ -125,7 +125,52 @@ def test_worker_continues_after_an_image_fails(monkeypatch, tmp_path: Path) -> N
 
     assert result[0][0] == 1
     assert result[0][1] == [("one.png", "OCR failed")]
-    assert (worker.output_dir / "two.png").exists()
+    assert (worker.output_dir / "two_SRE027.png").exists()
+
+
+def test_worker_assigns_distinct_final_name_and_preserves_source(
+    monkeypatch, tmp_path: Path
+) -> None:
+    source = make_image(tmp_path / "photo.PNG")
+    source_bytes = source.read_bytes()
+    output = tmp_path / "output"
+    output.mkdir()
+
+    def fake_edit(
+        input_path: Path,
+        output_path: Path,
+        number: int,
+        *,
+        full_line_text: str | None = None,
+    ) -> None:
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(app, "edit_image", fake_edit)
+    BatchWorker([source], output, 27).run()
+
+    assert [path.name for path in output.iterdir()] == ["photo_SRE027.png"]
+    assert source.read_bytes() == source_bytes
+
+
+def test_worker_counters_duplicate_generated_names(monkeypatch, tmp_path: Path) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    files = [make_image(first_dir / "photo.png"), make_image(second_dir / "photo.png")]
+    output = tmp_path / "output"
+    output.mkdir()
+
+    def fake_edit(input_path: Path, output_path: Path, number: int) -> None:
+        output_path.write_bytes(input_path.read_bytes())
+
+    monkeypatch.setattr(app, "edit_image", fake_edit)
+    BatchWorker(files, output, 27).run()
+
+    assert sorted(path.name for path in output.iterdir()) == [
+        "photo_SRE027 (2).png",
+        "photo_SRE027.png",
+    ]
 
 
 def test_worker_can_cancel_before_processing(tmp_path: Path) -> None:
@@ -236,6 +281,7 @@ def test_result_waits_for_progress_to_reach_100(qtbot, tmp_path: Path) -> None:
     assert window.pages.currentIndex() == 2
     qtbot.waitUntil(lambda: window.pages.currentIndex() == 3, timeout=1000)
     assert window.progress.value() == 100
+    assert "photo.png → photo_SRE010.png" in window.result_summary.text()
     window._cleanup_temp_dir()
 
 
@@ -266,10 +312,10 @@ def test_batch_failure_is_transactional_and_selects_problem_files(
 def test_export_worker_supports_folder_collisions_and_zip(tmp_path: Path) -> None:
     prepared = tmp_path / "prepared"
     prepared.mkdir()
-    source = make_image(prepared / "photo.png")
+    source = make_image(prepared / "photo_SRE027.png")
     destination = tmp_path / "destination"
     destination.mkdir()
-    make_image(destination / "photo.png")
+    make_image(destination / "photo_SRE027.png")
 
     folder_worker = ExportWorker([source], "folder", destination)
     folder_result = []
@@ -279,7 +325,7 @@ def test_export_worker_supports_folder_collisions_and_zip(tmp_path: Path) -> Non
     folder_worker.run()
 
     assert folder_result[0][0]
-    assert (destination / "photo (2).png").exists()
+    assert (destination / "photo_SRE027 (2).png").exists()
 
     archive_path = tmp_path / "images.zip"
     zip_worker = ExportWorker([source], "zip", archive_path)
@@ -291,4 +337,4 @@ def test_export_worker_supports_folder_collisions_and_zip(tmp_path: Path) -> Non
 
     assert zip_result[0][0]
     with zipfile.ZipFile(archive_path) as archive:
-        assert archive.namelist() == ["photo.png"]
+        assert archive.namelist() == ["photo_SRE027.png"]

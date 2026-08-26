@@ -8,8 +8,10 @@ from PIL import Image
 
 import sre_processor
 from sre_processor import (
+    MAX_EDITED_FILENAME_BYTES,
     collision_safe_path,
     draw_replacement_line,
+    edited_filename,
     encode_edited_image,
     edit_image,
     fit_font_size,
@@ -58,6 +60,60 @@ def test_collision_safe_path_preserves_name_and_adds_counter(tmp_path: Path) -> 
     assert collision_safe_path(tmp_path, "photo.jpeg") == tmp_path / "photo (2).jpeg"
     (tmp_path / "photo (2).jpeg").touch()
     assert collision_safe_path(tmp_path, "photo.jpeg") == tmp_path / "photo (3).jpeg"
+
+
+@pytest.mark.parametrize(
+    ("filename", "number", "expected"),
+    [
+        ("photo.PNG", 27, "photo_SRE027.png"),
+        ("MyPhoto.JPG", 7, "MyPhoto_SRE007.jpg"),
+        ("photo_sre010.png", 27, "photo_SRE027.png"),
+        ("photo_SrE999.JPEG", 0, "photo_SRE000.jpeg"),
+    ],
+)
+def test_edited_filename_for_numeric_edits(
+    filename: str, number: int, expected: str
+) -> None:
+    assert edited_filename(filename, number) == expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "text", "expected"),
+    [
+        ("photo.png", "ÁREA 1 / NORTE", "photo_area_1_norte.png"),
+        ("photo.png", "!!!", "photo_editada.png"),
+        ("photo_linha_nova.png", "OUTRA LINHA", "photo_linha_nova_outra_linha.png"),
+        ("photo_SRE010.PNG", "LINHA NOVA", "photo_SRE010_linha_nova.png"),
+    ],
+)
+def test_edited_filename_for_full_line_edits(
+    filename: str, text: str, expected: str
+) -> None:
+    assert edited_filename(filename, 27, full_line_text=text) == expected
+
+
+def test_edited_filename_limits_utf8_bytes_and_preserves_distinguishing_suffix() -> None:
+    numeric = edited_filename(f"{'á' * 180}.PNG", 27)
+    full_line = edited_filename(f"{'á' * 180}.PNG", 27, full_line_text="ÁREA NORTE")
+
+    assert len(numeric.encode("utf-8")) <= MAX_EDITED_FILENAME_BYTES
+    assert numeric.endswith("_SRE027.png")
+    assert len(full_line.encode("utf-8")) <= MAX_EDITED_FILENAME_BYTES
+    assert full_line.endswith("_a.png")
+
+
+def test_collision_counter_respects_filename_byte_limit(tmp_path: Path) -> None:
+    filename = edited_filename(f"{'á' * 180}.PNG", 27)
+    (tmp_path / filename).touch()
+
+    candidate = collision_safe_path(
+        tmp_path,
+        filename,
+        max_filename_bytes=MAX_EDITED_FILENAME_BYTES,
+    )
+
+    assert candidate.name.endswith(" (2).png")
+    assert len(candidate.name.encode("utf-8")) <= MAX_EDITED_FILENAME_BYTES
 
 
 def test_unique_paths_filters_unsupported_and_duplicates(tmp_path: Path) -> None:

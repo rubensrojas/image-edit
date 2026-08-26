@@ -60,9 +60,11 @@ from PySide6.QtWidgets import (
 )
 
 from sre_processor import (
+    MAX_EDITED_FILENAME_BYTES,
     SUPPORTED_EXTENSIONS,
     collision_safe_path,
     edit_image,
+    edited_filename,
     encode_edited_image,
     is_supported_file,
     read_raw_line_3,
@@ -378,7 +380,16 @@ class BatchWorker(QRunnable):
                 return
             self.signals.current.emit(input_path.name)
             try:
-                output_path = collision_safe_path(self.output_dir, input_path.name)
+                output_name = edited_filename(
+                    input_path.name,
+                    self.sre_number,
+                    full_line_text=self.full_line_text,
+                )
+                output_path = collision_safe_path(
+                    self.output_dir,
+                    output_name,
+                    max_filename_bytes=MAX_EDITED_FILENAME_BYTES,
+                )
                 if self.full_line_text is None:
                     edit_image(input_path, output_path, self.sre_number)
                 else:
@@ -460,7 +471,11 @@ class ExportWorker(QRunnable):
                 self.destination.mkdir(parents=True, exist_ok=True)
                 total = len(self.files)
                 for index, source in enumerate(self.files, start=1):
-                    target = collision_safe_path(self.destination, source.name)
+                    target = collision_safe_path(
+                        self.destination,
+                        source.name,
+                        max_filename_bytes=MAX_EDITED_FILENAME_BYTES,
+                    )
                     shutil.copy2(source, target)
                     self.signals.progress.emit(index, total)
                 open_location = self.destination
@@ -1190,9 +1205,21 @@ class MainWindow(QMainWindow):
             self.result_title.setText(
                 f"{completed} imagem pronta" if completed == 1 else f"{completed} imagens prontas"
             )
+            full_line_text = (
+                self.full_line_input.text().strip()
+                if self.full_line_toggle.isChecked()
+                else None
+            )
+            example_input = self.files[0].name
+            example_output = edited_filename(
+                example_input,
+                self.sre_number.value(),
+                full_line_text=full_line_text,
+            )
             self.result_summary.setText(
                 "Escolha como salvar. Você pode exportar para uma pasta e também "
-                "criar um ZIP sem reprocessar."
+                "criar um ZIP sem reprocessar. Os arquivos editados usam nomes "
+                f"diferentes dos originais, por exemplo: {example_input} → {example_output}."
             )
             self.result_error_list.hide()
             self.export_actions.show()
