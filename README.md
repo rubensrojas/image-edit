@@ -1,18 +1,24 @@
 # SRE Image Editor
 
-Um aplicativo desktop para editar a terceira linha da legenda de várias imagens. Por padrão, ele altera apenas o número MT/SRE e preserva o sufixo `EMT` identificado por OCR. O modo **Editar linha completa** permite substituir toda a terceira linha pelo mesmo texto.
+Um aplicativo desktop para editar a terceira linha da legenda de várias imagens. Por padrão, ele altera apenas o número MT/SRE e preserva o sufixo `EMT` identificado por OCR. O modo **Linha completa (3ª linha)** permite substituir toda a terceira linha pelo mesmo texto, e o **Modo livre** permite trocar qualquer linha da legenda.
 
 ## Como usar
 
 1. Arraste arquivos JPG, JPEG, PNG ou WebP para a janela ou clique em **Selecionar imagens** e escolha **Continuar**.
-2. Informe o número SRE ou ative **Editar linha completa**. Nesse modo, confira e ajuste o texto detectado na primeira imagem.
+2. Informe o número SRE ou escolha **Linha completa (3ª linha)**. Nesse modo, confira e ajuste o texto detectado na primeira imagem. Para editar outra linha, use o **Modo livre** (veja abaixo).
 3. Compare as imagens **Antes** e **Depois** e escolha **Aplicar edição em todas as imagens**.
 4. Acompanhe o progresso do lote. Você pode cancelar com segurança enquanto ele é processado.
 5. Quando todas as imagens estiverem prontas, salve-as em uma pasta ou em um arquivo ZIP.
 
+### Modo livre
+
+No **Modo livre**, clique na linha que deseja trocar na imagem original da prévia (ou escolha-a na lista) e digite o novo texto. A mesma linha, contada de cima para baixo, é substituída em todas as imagens do lote, mantendo a posição, o tamanho e a cor da letra. Funciona com caixas de legenda sólidas ou translúcidas: a textura da foto por trás da caixa é preservada.
+
+Todas as imagens do lote precisam ter o mesmo formato e a legenda na mesma posição, com o mesmo número de linhas. Se o texto não couber na caixa ou a linha escolhida não existir em alguma imagem, o lote é interrompido.
+
 Os originais nunca são alterados. Se qualquer imagem falhar, o lote inteiro é interrompido e a tela de resultado indica quais arquivos precisam ser revisados.
 
-O aplicativo desktop sempre usa um nome diferente para cada resultado. Uma edição numérica transforma, por exemplo, `foto.JPG` em `foto_SRE027.jpg`. No modo **Editar linha completa**, o texto é convertido em um identificador seguro, como `foto_area_1_norte.png`. Se o nome já existir na pasta escolhida, o aplicativo adiciona um contador, como `foto_SRE027 (2).jpg`, sem substituir arquivos existentes. Os mesmos nomes são preservados dentro de arquivos ZIP.
+O aplicativo desktop sempre usa um nome diferente para cada resultado. Uma edição numérica transforma, por exemplo, `foto.JPG` em `foto_SRE027.jpg`. Nos modos **Linha completa (3ª linha)** e **Modo livre**, o texto é convertido em um identificador seguro, como `foto_area_1_norte.png`. Se o nome já existir na pasta escolhida, o aplicativo adiciona um contador, como `foto_SRE027 (2).jpg`, sem substituir arquivos existentes. Os mesmos nomes são preservados dentro de arquivos ZIP.
 
 ### Como abrir uma versão não assinada
 

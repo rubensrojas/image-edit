@@ -12,6 +12,7 @@ from PIL import Image
 from PySide6.QtCore import (
     QEasingCurve,
     QObject,
+    QPoint,
     QPointF,
     QRunnable,
     QRect,
@@ -32,14 +33,16 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QIcon,
+    QMouseEvent,
     QPainter,
     QPen,
     QPixmap,
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
-    QCheckBox,
+    QButtonGroup,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -51,6 +54,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -62,11 +66,16 @@ from PySide6.QtWidgets import (
 from sre_processor import (
     MAX_EDITED_FILENAME_BYTES,
     SUPPORTED_EXTENSIONS,
+    CaptionLayout,
+    CaptionReference,
     collision_safe_path,
+    detect_caption_layout,
+    detect_caption_reference,
     edit_image,
     edited_filename,
     encode_edited_image,
     is_supported_file,
+    read_caption_lines,
     read_raw_line_3,
     resource_root,
     tesseract_version,
@@ -76,6 +85,7 @@ from sre_processor import (
 
 APP_NAME = "SRE Image Editor"
 ACCENT = "#D4AF37"
+NUMBER_MODE, FULL_LINE_MODE, FREE_MODE = range(3)
 
 
 class PaddedSpinBox(QSpinBox):
@@ -227,6 +237,8 @@ class DirectionArrow(QWidget):
 class PreviewImage(QLabel):
     """High-resolution preview with an overlay fitted to the rendered image."""
 
+    line_clicked = Signal(int)
+
     def __init__(
         self,
         accessible_name: str,
@@ -235,7 +247,11 @@ class PreviewImage(QLabel):
         super().__init__()
         self._source = QPixmap()
         self._image_rect = QRect()
+        self._line_regions: list[QRect] = []
+        self._hovered_line = -1
+        self._selected_line = -1
         self._horizontal_alignment = alignment
+        self.setMouseTracking(True)
         self.setObjectName("previewImage")
         self.setAlignment(alignment | Qt.AlignmentFlag.AlignVCenter)
         self.setMinimumSize(260, 360)
@@ -252,6 +268,10 @@ class PreviewImage(QLabel):
     def is_loading(self) -> bool:
         return not self.loading_overlay.isHidden()
 
+    @property
+    def source(self) -> QPixmap:
+        return self._source
+
     def set_source(self, pixmap: QPixmap) -> None:
         self._source = pixmap
         self._refresh_pixmap()
@@ -260,8 +280,87 @@ class PreviewImage(QLabel):
         self.loading_overlay.stop()
         self._source = QPixmap()
         self._image_rect = QRect()
+        self.set_line_regions([])
         super().clear()
         self.setText(message)
+
+    def set_line_regions(self, regions: list[QRect]) -> None:
+        """Clickable caption lines, in source-image pixels."""
+        self._line_regions = list(regions)
+        self._hovered_line = -1
+        self._selected_line = -1
+        self.unsetCursor()
+        self.update()
+
+    def set_selected_line(self, index: int) -> None:
+        self._selected_line = index
+        self.update()
+
+    def line_region_rect(self, index: int) -> QRect:
+        """Clickable area of one line in widget pixels, padded for thin lines."""
+        if self._source.isNull() or self._image_rect.isEmpty():
+            return QRect()
+        scale = self._image_rect.width() / self._source.width()
+        region = self._line_regions[index]
+        mapped = QRect(
+            self._image_rect.left() + round(region.left() * scale),
+            self._image_rect.top() + round(region.top() * scale),
+            max(1, round(region.width() * scale)),
+            max(1, round(region.height() * scale)),
+        )
+        return mapped.adjusted(-6, -3, 6, 3)
+
+    def _line_at(self, point: QPoint) -> int:
+        for index in range(len(self._line_regions)):
+            if self.line_region_rect(index).contains(point):
+                return index
+        return -1
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        hovered = self._line_at(event.position().toPoint())
+        if hovered != self._hovered_line:
+            self._hovered_line = hovered
+            if hovered >= 0:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.unsetCursor()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        index = self._line_at(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and index >= 0:
+            self.line_clicked.emit(index)
+            return
+        super().mousePressEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._hovered_line != -1:
+            self._hovered_line = -1
+            self.unsetCursor()
+            self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().paintEvent(event)
+        if not self._line_regions:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        accent = QColor(ACCENT)
+        for index in range(len(self._line_regions)):
+            rect = QRectF(self.line_region_rect(index))
+            active = index in (self._hovered_line, self._selected_line)
+            fill = QColor(accent)
+            fill.setAlpha(70 if active else 0)
+            outline = QColor(accent)
+            outline.setAlpha(255 if active else 140)
+            pen = QPen(outline, 2 if index == self._selected_line else 1)
+            if not active:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 4, 4)
 
     def set_loading(self, loading: bool) -> None:
         if loading and not self._image_rect.isEmpty():
@@ -359,6 +458,9 @@ class BatchWorker(QRunnable):
         sre_number: int,
         *,
         full_line_text: str | None = None,
+        line_number: int | None = None,
+        caption_reference: CaptionReference | None = None,
+        expected_line_count: int | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
         super().__init__()
@@ -366,6 +468,9 @@ class BatchWorker(QRunnable):
         self.output_dir = output_dir
         self.sre_number = sre_number
         self.full_line_text = full_line_text
+        self.line_number = line_number
+        self.caption_reference = caption_reference
+        self.expected_line_count = expected_line_count
         self.cancel_event = cancel_event or threading.Event()
         self.signals = WorkerSignals()
 
@@ -392,12 +497,22 @@ class BatchWorker(QRunnable):
                 )
                 if self.full_line_text is None:
                     edit_image(input_path, output_path, self.sre_number)
+                elif self.line_number is None:
+                    edit_image(
+                        input_path,
+                        output_path,
+                        self.sre_number,
+                        full_line_text=self.full_line_text,
+                    )
                 else:
                     edit_image(
                         input_path,
                         output_path,
                         self.sre_number,
                         full_line_text=self.full_line_text,
+                        line_number=self.line_number,
+                        caption_reference=self.caption_reference,
+                        expected_line_count=self.expected_line_count,
                     )
                 completed += 1
             except Exception as exc:  # Keep scanning so the user sees every failure.
@@ -422,6 +537,8 @@ class PreviewWorker(QRunnable):
         sre_number: int,
         full_line_text: str | None,
         read_raw_text: bool,
+        line_number: int | None = None,
+        caption_reference: CaptionReference | None = None,
     ) -> None:
         super().__init__()
         self.request_id = request_id
@@ -429,6 +546,8 @@ class PreviewWorker(QRunnable):
         self.sre_number = sre_number
         self.full_line_text = full_line_text
         self.read_raw_text = read_raw_text
+        self.line_number = line_number
+        self.caption_reference = caption_reference
         self.signals = PreviewSignals()
 
     @Slot()
@@ -445,10 +564,39 @@ class PreviewWorker(QRunnable):
                 self.input_path,
                 self.sre_number,
                 full_line_text=self.full_line_text,
+                line_number=self.line_number,
+                caption_reference=self.caption_reference,
             )
             self.signals.ready.emit(self.request_id, encoded, raw_text)
         except Exception as exc:
             self.signals.failed.emit(self.request_id, str(exc), raw_text)
+
+
+class LineDetectionSignals(QObject):
+    ready = Signal(int, object, object, object)
+    failed = Signal(int, str)
+
+
+class LineDetectionWorker(QRunnable):
+    def __init__(self, request_id: int, files: list[Path]) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.files = files
+        self.signals = LineDetectionSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            # The caption sits in the same place across the batch, so its box
+            # is voted over several images and shared by preview and batch.
+            reference = detect_caption_reference(self.files)
+            with Image.open(self.files[0]) as source:
+                img = source.convert("RGB")
+            layout = detect_caption_layout(img, reference)
+            texts = read_caption_lines(img, layout)
+            self.signals.ready.emit(self.request_id, layout, texts, reference)
+        except Exception as exc:
+            self.signals.failed.emit(self.request_id, str(exc))
 
 
 class ExportSignals(QObject):
@@ -522,6 +670,14 @@ class MainWindow(QMainWindow):
         self.preview_path: Path | None = None
         self.raw_line_loaded = False
         self.full_text_touched = False
+        self.detection_request_id = 0
+        self.detecting_lines = False
+        self.free_layout: CaptionLayout | None = None
+        self.free_reference: CaptionReference | None = None
+        self.free_reference_files: list[Path] = []
+        self.free_texts: list[str] = []
+        self.free_line: int | None = None
+        self.free_error = ""
         self.closing_after_cancel = False
         self.pending_batch_result: tuple[int, list[tuple[str, str]]] | None = None
 
@@ -645,13 +801,31 @@ class MainWindow(QMainWindow):
         layout.addLayout(heading_row)
         layout.addWidget(detail)
 
+        mode_switch = QFrame()
+        mode_switch.setObjectName("modeSwitch")
+        mode_layout = QHBoxLayout(mode_switch)
+        mode_layout.setContentsMargins(3, 3, 3, 3)
+        mode_layout.setSpacing(3)
+        self.mode_group = QButtonGroup(self)
+        self.number_mode_button = QRadioButton("Número SRE")
+        self.full_line_toggle = QRadioButton("Linha completa (3ª linha)")
+        self.free_mode_button = QRadioButton("Modo livre")
+        for mode, button in enumerate(
+            (self.number_mode_button, self.full_line_toggle, self.free_mode_button)
+        ):
+            button.setObjectName("modeOption")
+            button.setAccessibleName(f"Modo de edição: {button.text()}")
+            self.mode_group.addButton(button, mode)
+            mode_layout.addWidget(button)
+        self.number_mode_button.setChecked(True)
+        self.mode_group.idToggled.connect(self.mode_changed)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(mode_switch)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
         controls = QHBoxLayout()
         controls.setSpacing(14)
-        self.full_line_toggle = QCheckBox("Editar linha completa")
-        self.full_line_toggle.setObjectName("modeToggle")
-        self.full_line_toggle.setAccessibleName("Editar linha completa")
-        self.full_line_toggle.toggled.connect(self.mode_changed)
-        controls.addWidget(self.full_line_toggle)
 
         self.edit_inputs = QStackedWidget()
         self.edit_inputs.setObjectName("editInputs")
@@ -690,8 +864,49 @@ class MainWindow(QMainWindow):
         full_layout.addWidget(self.full_line_input)
         full_layout.addWidget(self.full_line_message)
 
+        free_page = QWidget()
+        free_layout = QVBoxLayout(free_page)
+        free_layout.setContentsMargins(0, 0, 0, 0)
+        free_layout.setSpacing(8)
+        free_notice = QLabel(
+            "Todas as imagens do lote devem ter o mesmo formato, com a legenda na "
+            "mesma posição. A linha escolhida será substituída em todas elas."
+        )
+        free_notice.setObjectName("freeNotice")
+        free_notice.setWordWrap(True)
+        free_layout.addWidget(free_notice)
+        free_row = QHBoxLayout()
+        free_row.setSpacing(14)
+        self.line_options = QWidget()
+        self.line_options.setFixedWidth(420)
+        self.line_options_layout = QGridLayout(self.line_options)
+        self.line_options_layout.setContentsMargins(0, 0, 0, 0)
+        self.line_options_layout.setSpacing(4)
+        self.line_option_group = QButtonGroup(self)
+        self.line_option_group.idClicked.connect(self.select_free_line)
+        free_row.addWidget(self.line_options, 0, Qt.AlignmentFlag.AlignTop)
+        free_fields = QVBoxLayout()
+        free_fields.setSpacing(5)
+        self.free_line_label = QLabel("Clique em uma linha da imagem original")
+        self.free_line_label.setObjectName("sectionLabel")
+        self.free_line_input = QLineEdit()
+        self.free_line_input.setAccessibleName("Novo texto da linha escolhida")
+        self.free_line_input.setPlaceholderText("Escolha uma linha para editar")
+        self.free_line_input.setEnabled(False)
+        self.free_line_input.textEdited.connect(self.free_line_edited)
+        self.free_line_message = QLabel("")
+        self.free_line_message.setObjectName("fieldMessage")
+        self.free_line_message.setWordWrap(True)
+        free_fields.addWidget(self.free_line_label)
+        free_fields.addWidget(self.free_line_input)
+        free_fields.addWidget(self.free_line_message)
+        free_row.addLayout(free_fields, 1)
+        free_layout.addLayout(free_row)
+
         self.edit_inputs.addWidget(number_page)
         self.edit_inputs.addWidget(full_page)
+        self.edit_inputs.addWidget(free_page)
+        self._fit_edit_inputs(NUMBER_MODE)
         controls.addWidget(self.edit_inputs, 1)
         layout.addLayout(controls)
 
@@ -704,6 +919,7 @@ class MainWindow(QMainWindow):
         self.before_preview = PreviewImage(
             "Imagem original", Qt.AlignmentFlag.AlignRight
         )
+        self.before_preview.line_clicked.connect(self.select_free_line)
         after_label = QLabel("DEPOIS")
         after_label.setObjectName("previewCaption")
         after_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -929,8 +1145,12 @@ class MainWindow(QMainWindow):
             self.raw_line_loaded = False
             if not self.full_text_touched:
                 self.full_line_input.clear()
+            self._reset_free_mode()
             self.preview_bytes = b""
             self.after_preview.clear_source()
+        elif self.free_reference_files and self.free_reference_files != self.files:
+            # The batch changed, so the voted caption box must be voted again.
+            self._reset_free_mode()
         before = QPixmap(str(input_path))
         if before.isNull():
             self.before_preview.clear_source("Não foi possível abrir esta imagem")
@@ -943,14 +1163,39 @@ class MainWindow(QMainWindow):
         self.show_page(1)
         self.schedule_preview(immediate=True)
 
-    @Slot(bool)
-    def mode_changed(self, full_line: bool) -> None:
-        self.edit_inputs.setCurrentIndex(1 if full_line else 0)
-        self.schedule_preview(immediate=full_line and not self.raw_line_loaded)
+    def current_mode(self) -> int:
+        return self.mode_group.checkedId()
+
+    @Slot(int, bool)
+    def mode_changed(self, mode: int, checked: bool) -> None:
+        if not checked:
+            return
+        self.edit_inputs.setCurrentIndex(mode)
+        self._fit_edit_inputs(mode)
+        self._refresh_line_regions()
+        full_line = mode == FULL_LINE_MODE
+        self.schedule_preview(
+            immediate=mode == FREE_MODE or (full_line and not self.raw_line_loaded)
+        )
 
     @Slot(str)
     def full_line_edited(self, _text: str) -> None:
         self.full_text_touched = True
+        self.schedule_preview()
+
+    def _fit_edit_inputs(self, mode: int) -> None:
+        # Only the visible inputs count toward the height, so the preview keeps the space.
+        for index in range(self.edit_inputs.count()):
+            vertical = (
+                QSizePolicy.Policy.Preferred if index == mode else QSizePolicy.Policy.Ignored
+            )
+            self.edit_inputs.widget(index).setSizePolicy(
+                QSizePolicy.Policy.Preferred, vertical
+            )
+        self.edit_inputs.updateGeometry()
+
+    @Slot(str)
+    def free_line_edited(self, _text: str) -> None:
         self.schedule_preview()
 
     @Slot()
@@ -971,6 +1216,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def start_preview(self) -> None:
         if not self.files:
+            return
+        if self.current_mode() == FREE_MODE:
+            self._start_free_preview()
             return
         full_line_text = None
         if self.full_line_toggle.isChecked():
@@ -999,11 +1247,154 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(self.preview_failed)
         self.thread_pool.start(worker)
 
+    def _start_free_preview(self) -> None:
+        text = self.free_line_input.text().strip()
+        if self.free_layout is None or self.free_line is None or not text:
+            self.preview_loading = False
+            self.preview_valid = False
+            self.after_preview.set_loading(False)
+            self.apply_button.setEnabled(False)
+            if self.free_line is None and not self.before_preview.source.isNull():
+                self.after_preview.set_source(self.before_preview.source)
+            if self.free_error:
+                self._set_preview_status(self.free_error, error=True)
+            elif self.free_layout is None:
+                self._start_line_detection()
+                self._set_preview_status("Detectando as linhas da legenda…")
+            elif self.free_line is None:
+                self._set_preview_status(
+                    "Clique em uma linha da imagem original para escolher o que substituir."
+                )
+            else:
+                self._set_free_line_message(
+                    f"Digite o novo texto da linha {self.free_line}.", error=True
+                )
+                self._set_preview_status("A prévia será atualizada quando houver texto.")
+            return
+        worker = PreviewWorker(
+            self.preview_request_id,
+            self.files[0],
+            self.sre_number.value(),
+            text,
+            False,
+            line_number=self.free_line,
+            caption_reference=self.free_reference,
+        )
+        worker.signals.ready.connect(self.preview_ready)
+        worker.signals.failed.connect(self.preview_failed)
+        self.thread_pool.start(worker)
+
+    def _start_line_detection(self) -> None:
+        if self.detecting_lines:
+            return
+        self.detecting_lines = True
+        self.detection_request_id += 1
+        self._set_free_line_message("Detectando as linhas da legenda…")
+        self.before_preview.set_loading(True)
+        self.free_reference_files = list(self.files)
+        worker = LineDetectionWorker(self.detection_request_id, list(self.files))
+        worker.signals.ready.connect(self.line_detection_ready)
+        worker.signals.failed.connect(self.line_detection_failed)
+        self.thread_pool.start(worker)
+
+    @Slot(int, object, object, object)
+    def line_detection_ready(
+        self, request_id: int, layout: object, texts: object, reference: object
+    ) -> None:
+        if request_id != self.detection_request_id:
+            return
+        self.detecting_lines = False
+        self.free_reference = reference  # type: ignore[assignment]
+        self.before_preview.set_loading(False)
+        self.free_layout = layout  # type: ignore[assignment]
+        self.free_texts = list(texts)  # type: ignore[call-overload]
+        rows = (len(self.free_texts) + 1) // 2
+        for index, text in enumerate(self.free_texts):
+            label = f"Linha {index + 1} · {text or '(não lida)'}"
+            button = QPushButton()
+            button.setObjectName("lineOption")
+            button.setCheckable(True)
+            button.setToolTip(label)
+            button.setAccessibleName(label)
+            button.setText(
+                button.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, 170)
+            )
+            self.line_option_group.addButton(button, index)
+            self.line_options_layout.addWidget(button, index % rows, index // rows)
+        self._set_free_line_message(
+            "Clique em uma linha na imagem original ou escolha na lista."
+        )
+        self._refresh_line_regions()
+        if self.current_mode() == FREE_MODE:
+            self.schedule_preview(immediate=True)
+
+    @Slot(int, str)
+    def line_detection_failed(self, request_id: int, message: str) -> None:
+        if request_id != self.detection_request_id:
+            return
+        self.detecting_lines = False
+        self.before_preview.set_loading(False)
+        self.free_error = f"Não foi possível detectar as linhas da legenda. {message}"
+        self._set_free_line_message(self.free_error, error=True)
+        if self.current_mode() == FREE_MODE:
+            self.schedule_preview(immediate=True)
+
+    @Slot(int)
+    def select_free_line(self, index: int) -> None:
+        if self.current_mode() != FREE_MODE or not 0 <= index < len(self.free_texts):
+            return
+        self.free_line = index + 1
+        self.before_preview.set_selected_line(index)
+        self.line_option_group.button(index).setChecked(True)
+        self.free_line_label.setText(f"Novo texto da linha {self.free_line}")
+        self.free_line_input.setEnabled(True)
+        self.free_line_input.setText(self.free_texts[index])
+        self.free_line_input.setFocus()
+        self._set_free_line_message("O texto detectado é apenas um rascunho. Confira a prévia.")
+        self.schedule_preview(immediate=True)
+
+    def _refresh_line_regions(self) -> None:
+        if self.current_mode() != FREE_MODE or self.free_layout is None:
+            self.before_preview.set_line_regions([])
+            return
+        self.before_preview.set_line_regions(
+            [QRect(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in self.free_layout.lines]
+        )
+        if self.free_line is not None:
+            self.before_preview.set_selected_line(self.free_line - 1)
+
+    def _reset_free_mode(self) -> None:
+        self.detection_request_id += 1
+        self.detecting_lines = False
+        self.before_preview.set_loading(False)
+        self.free_layout = None
+        self.free_reference = None
+        self.free_reference_files = []
+        self.free_texts = []
+        self.free_line = None
+        self.free_error = ""
+        for button in self.line_option_group.buttons():
+            self.line_option_group.removeButton(button)
+            button.deleteLater()
+        self.before_preview.set_line_regions([])
+        self.free_line_label.setText("Clique em uma linha da imagem original")
+        self.free_line_input.clear()
+        self.free_line_input.setEnabled(False)
+        self._set_free_line_message("")
+
+    def _batch_line_text(self) -> str | None:
+        if self.current_mode() == FREE_MODE:
+            return self.free_line_input.text().strip()
+        if self.current_mode() == FULL_LINE_MODE:
+            return self.full_line_input.text().strip()
+        return None
+
     @Slot(int, bytes, str)
     def preview_ready(self, request_id: int, encoded: bytes, raw_text: str) -> None:
         if request_id != self.preview_request_id:
             return
-        if self._apply_raw_line(raw_text) and self.full_line_toggle.isChecked():
+        free_mode = self.current_mode() == FREE_MODE
+        if not free_mode and self._apply_raw_line(raw_text) and self.full_line_toggle.isChecked():
             self.schedule_preview(immediate=True)
             return
         if self.full_line_toggle.isChecked() and not self.full_line_input.text().strip():
@@ -1031,13 +1422,18 @@ class MainWindow(QMainWindow):
             self._set_full_line_message(
                 "A linha cabe sem reduzir a fonte. Confira o resultado na imagem."
             )
+        if free_mode:
+            self._set_free_line_message(
+                "A linha cabe sem reduzir a fonte. Confira o resultado na imagem."
+            )
         self.apply_button.setEnabled(bool(self.files))
 
     @Slot(int, str, str)
     def preview_failed(self, request_id: int, message: str, raw_text: str) -> None:
         if request_id != self.preview_request_id:
             return
-        if self._apply_raw_line(raw_text) and self.full_line_toggle.isChecked():
+        free_mode = self.current_mode() == FREE_MODE
+        if not free_mode and self._apply_raw_line(raw_text) and self.full_line_toggle.isChecked():
             self.schedule_preview(immediate=True)
             return
         self.preview_loading = False
@@ -1046,6 +1442,8 @@ class MainWindow(QMainWindow):
         self._set_preview_status(message, error=True)
         if self.full_line_toggle.isChecked():
             self._set_full_line_message(message, error=True)
+        if free_mode:
+            self._set_free_line_message(message, error=True)
         self.apply_button.setEnabled(False)
 
     def _apply_raw_line(self, raw_text: str) -> bool:
@@ -1069,6 +1467,12 @@ class MainWindow(QMainWindow):
         self.full_line_message.setProperty("error", error)
         self.full_line_message.style().unpolish(self.full_line_message)
         self.full_line_message.style().polish(self.full_line_message)
+
+    def _set_free_line_message(self, text: str, *, error: bool = False) -> None:
+        self.free_line_message.setText(text)
+        self.free_line_message.setProperty("error", error)
+        self.free_line_message.style().unpolish(self.free_line_message)
+        self.free_line_message.style().polish(self.free_line_message)
 
     def _set_preview_status(self, text: str, *, error: bool = False) -> None:
         self.preview_status.setText(text)
@@ -1096,14 +1500,20 @@ class MainWindow(QMainWindow):
         self.cancel_button.setText("Cancelar edição")
         self.show_page(2)
 
-        full_line_text = (
-            self.full_line_input.text().strip() if self.full_line_toggle.isChecked() else None
-        )
         worker = BatchWorker(
             list(self.files),
             self.temp_dir,
             self.sre_number.value(),
-            full_line_text=full_line_text,
+            full_line_text=self._batch_line_text(),
+            line_number=self.free_line if self.current_mode() == FREE_MODE else None,
+            caption_reference=(
+                self.free_reference if self.current_mode() == FREE_MODE else None
+            ),
+            expected_line_count=(
+                len(self.free_layout.lines)
+                if self.current_mode() == FREE_MODE and self.free_layout
+                else None
+            ),
             cancel_event=self.cancel_event,
         )
         self.batch_worker = worker
@@ -1205,16 +1615,11 @@ class MainWindow(QMainWindow):
             self.result_title.setText(
                 f"{completed} imagem pronta" if completed == 1 else f"{completed} imagens prontas"
             )
-            full_line_text = (
-                self.full_line_input.text().strip()
-                if self.full_line_toggle.isChecked()
-                else None
-            )
             example_input = self.files[0].name
             example_output = edited_filename(
                 example_input,
                 self.sre_number.value(),
-                full_line_text=full_line_text,
+                full_line_text=self._batch_line_text(),
             )
             self.result_summary.setText(
                 "Escolha como salvar. Você pode exportar para uma pasta e também "
@@ -1343,8 +1748,9 @@ class MainWindow(QMainWindow):
         self.preview_valid = False
         self.raw_line_loaded = False
         self.full_text_touched = False
-        self.full_line_toggle.setChecked(False)
+        self.number_mode_button.setChecked(True)
         self.full_line_input.clear()
+        self._reset_free_mode()
         self.sre_number.setValue(10)
         self.before_preview.clear_source()
         self.after_preview.clear_source()
@@ -1419,10 +1825,17 @@ QListWidget#fileList, QListWidget#errorList, QLineEdit, QSpinBox {{
 }}
 QListWidget#fileList:focus, QListWidget#errorList:focus, QLineEdit:focus, QSpinBox:focus {{ border: 2px solid {ACCENT}; }}
 QListWidget::item {{ padding: 6px; border-radius: 4px; }}
-QCheckBox#modeToggle {{ spacing: 10px; font-weight: 650; }}
-QCheckBox#modeToggle::indicator {{ width: 38px; height: 20px; border-radius: 10px; background: #353535; border: 1px solid #555; }}
-QCheckBox#modeToggle::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
-QCheckBox#modeToggle:focus {{ color: {ACCENT}; }}
+QFrame#modeSwitch {{ background: #1D1D1D; border: 1px solid #393939; border-radius: 9px; }}
+QRadioButton#modeOption {{ padding: 7px 14px; spacing: 0; border-radius: 6px; font-weight: 650; color: #BBB7AD; }}
+QRadioButton#modeOption::indicator {{ width: 0; height: 0; border: 0; background: transparent; image: none; }}
+QRadioButton#modeOption:hover {{ color: #FFFFFF; background: #262626; }}
+QRadioButton#modeOption:checked {{ background: {ACCENT}; color: #17140B; }}
+QRadioButton#modeOption:focus {{ border: 2px solid {ACCENT}; padding: 5px 12px; }}
+QLabel#freeNotice {{ background: #28251C; border-left: 3px solid {ACCENT}; border-radius: 4px; padding: 8px 12px; color: #F5F3EC; font-weight: 600; }}
+QPushButton#lineOption {{ min-height: 28px; padding: 0 10px; text-align: left; font-weight: 500; background: #1D1D1D; color: #E8E5DC; border: 1px solid #393939; border-radius: 6px; }}
+QPushButton#lineOption:hover {{ border-color: {ACCENT}; }}
+QPushButton#lineOption:checked {{ background: #4A4020; border: 1px solid {ACCENT}; color: #FFFFFF; }}
+QPushButton#lineOption:focus {{ border: 2px solid {ACCENT}; }}
 QPushButton {{ min-height: 40px; padding: 0 16px; border-radius: 8px; font-weight: 600; }}
 QPushButton#primaryButton {{ background: {ACCENT}; color: #17140B; border: 1px solid {ACCENT}; min-width: 120px; }}
 QPushButton#primaryButton:hover {{ background: #E1C35D; }}

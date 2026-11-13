@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import threading
 import zipfile
 from pathlib import Path
@@ -10,6 +11,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QLabel
 
 import app
+from sre_processor import CaptionReference
 from app import (
     STYLESHEET,
     AnimatedProgressBar,
@@ -19,6 +21,7 @@ from app import (
     PaddedSpinBox,
     PreviewImage,
 )
+from sre_processor import CaptionLayout
 
 
 def make_image(path: Path) -> Path:
@@ -94,17 +97,23 @@ def test_preview_preserves_aspect_ratio_and_overlay_matches_image(
     assert preview.is_loading
 
 
-def test_edit_mode_preserves_both_values(qtbot) -> None:
+def test_edit_mode_preserves_values_across_all_modes(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
+    assert window.number_mode_button.isChecked()
     window.sre_number.setValue(27)
     window.full_line_toggle.setChecked(True)
     window.full_line_input.setText("LINHA PERSONALIZADA")
-    window.full_line_toggle.setChecked(False)
+    window.free_mode_button.setChecked(True)
+    assert window.edit_inputs.currentIndex() == app.FREE_MODE
+    window.free_line_input.setText("LINHA LIVRE")
+    window.number_mode_button.setChecked(True)
+    assert window.edit_inputs.currentIndex() == app.NUMBER_MODE
     window.full_line_toggle.setChecked(True)
 
     assert window.sre_number.value() == 27
     assert window.full_line_input.text() == "LINHA PERSONALIZADA"
+    assert window.free_line_input.text() == "LINHA LIVRE"
 
 
 def test_worker_continues_after_an_image_fails(monkeypatch, tmp_path: Path) -> None:
@@ -338,3 +347,149 @@ def test_export_worker_supports_folder_collisions_and_zip(tmp_path: Path) -> Non
     assert zip_result[0][0]
     with zipfile.ZipFile(archive_path) as archive:
         assert archive.namelist() == ["photo_SRE027.png"]
+
+
+def fake_free_mode(monkeypatch) -> list[dict]:
+    layout = CaptionLayout(
+        box=(40, 200, 160, 290),
+        lines=((60, 210, 140, 222), (55, 232, 145, 244), (50, 254, 150, 266)),
+    )
+    previews: list[dict] = []
+
+    def fake_encode(input_path: Path, number: int, **kwargs) -> bytes:
+        previews.append(kwargs)
+        buffer = io.BytesIO()
+        Image.new("RGB", (200, 300), "gray").save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    reference = CaptionReference((0.0, 0.5, 1.0, 1.0))
+    monkeypatch.setattr(app, "detect_caption_reference", lambda files: reference)
+    monkeypatch.setattr(app, "detect_caption_layout", lambda img, ref=None: layout)
+    monkeypatch.setattr(
+        app, "read_caption_lines", lambda img, layout=None: ["UM", "DOIS", "LINHA TRÊS"]
+    )
+    monkeypatch.setattr(app, "read_raw_line_3", lambda img: "")
+    monkeypatch.setattr(app, "encode_edited_image", fake_encode)
+    return previews
+
+
+def test_free_mode_click_selects_line_and_enables_apply(
+    qtbot, monkeypatch, tmp_path: Path
+) -> None:
+    previews = fake_free_mode(monkeypatch)
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (200, 300), "black").save(path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.add_files([path])
+    window.continue_to_edit()
+
+    window.free_mode_button.click()
+    qtbot.waitUntil(lambda: window.free_layout is not None, timeout=2000)
+    qtbot.waitUntil(lambda: not window.preview_loading, timeout=2000)
+    assert window.free_line is None
+    assert not window.apply_button.isEnabled()
+    assert len(window.line_option_group.buttons()) == 3
+    assert "Linha 3 · LINHA TRÊS" in window.line_option_group.button(2).toolTip()
+
+    target = window.before_preview.line_region_rect(2)
+    assert not target.isEmpty()
+    qtbot.mouseClick(
+        window.before_preview, Qt.MouseButton.LeftButton, pos=target.center()
+    )
+
+    assert window.free_line == 3
+    assert window.line_option_group.button(2).isChecked()
+    assert window.free_line_input.text() == "LINHA TRÊS"
+    assert window.free_line_label.text() == "Novo texto da linha 3"
+    qtbot.waitUntil(lambda: window.apply_button.isEnabled(), timeout=2000)
+    assert previews[-1] == {
+        "full_line_text": "LINHA TRÊS",
+        "line_number": 3,
+        "caption_reference": CaptionReference((0.0, 0.5, 1.0, 1.0)),
+    }
+
+    window.line_option_group.button(0).click()
+    assert window.free_line == 1
+    assert window.free_line_input.text() == "UM"
+
+    window.free_line_input.clear()
+    window.free_line_edited("")
+    window.preview_timer.stop()
+    window.start_preview()
+    assert not window.apply_button.isEnabled()
+
+
+def test_free_mode_detection_failure_keeps_apply_disabled(
+    qtbot, monkeypatch, tmp_path: Path
+) -> None:
+    fake_free_mode(monkeypatch)
+
+    def fail(img, ref=None):
+        raise RuntimeError("Nenhuma legenda encontrada")
+
+    monkeypatch.setattr(app, "detect_caption_layout", fail)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.add_files([make_image(tmp_path / "photo.png")])
+    window.continue_to_edit()
+    window.free_mode_button.click()
+
+    qtbot.waitUntil(lambda: bool(window.free_error), timeout=2000)
+    qtbot.waitUntil(lambda: not window.preview_loading, timeout=2000)
+    assert "Nenhuma legenda encontrada" in window.free_line_message.text()
+    assert not window.apply_button.isEnabled()
+
+
+def test_new_batch_resets_free_mode(qtbot, monkeypatch, tmp_path: Path) -> None:
+    fake_free_mode(monkeypatch)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.add_files([make_image(tmp_path / "photo.png")])
+    window.continue_to_edit()
+    window.free_mode_button.click()
+    qtbot.waitUntil(lambda: window.free_layout is not None, timeout=2000)
+    window.select_free_line(1)
+
+    window.start_new_batch()
+
+    assert window.number_mode_button.isChecked()
+    assert window.free_layout is None
+    assert window.free_line is None
+    assert window.free_line_input.text() == ""
+    assert window.line_option_group.buttons() == []
+
+
+def test_worker_passes_line_number_in_free_mode(monkeypatch, tmp_path: Path) -> None:
+    image = make_image(tmp_path / "one.png")
+    output = tmp_path / "output"
+    output.mkdir()
+    received = []
+
+    def fake_edit(
+        input_path: Path,
+        output_path: Path,
+        number: int,
+        *,
+        full_line_text: str | None = None,
+        line_number: int | None = None,
+        caption_reference: CaptionReference | None = None,
+        expected_line_count: int | None = None,
+    ) -> None:
+        received.append((full_line_text, line_number, caption_reference))
+        output_path.touch()
+
+    monkeypatch.setattr(app, "edit_image", fake_edit)
+    reference = CaptionReference((0.2, 0.7, 0.8, 1.0))
+    BatchWorker(
+        [image],
+        output,
+        27,
+        full_line_text="NOVA LINHA",
+        line_number=2,
+        caption_reference=reference,
+    ).run()
+
+    assert received == [("NOVA LINHA", 2, reference)]
+    assert [path.name for path in output.iterdir()] == ["one_nova_linha.png"]

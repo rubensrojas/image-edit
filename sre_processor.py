@@ -6,9 +6,10 @@ import sys
 import unicodedata
 from io import BytesIO
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 import pytesseract
 
 
@@ -390,15 +391,513 @@ def draw_replacement_line(
     img.paste(layer, (x1, y1), layer)
 
 
+# --- Free mode: edit any caption line -------------------------------------
+
+Box = tuple[int, int, int, int]
+
+# Box sides must be straight luminance steps at least this share of the height.
+_MIN_BOX_HEIGHT = 0.08
+# The box top must darken at least this share of the box width in one row.
+_MIN_TOP_EDGE_SCORE = 0.5
+_EDGE_STEP = 10
+_TEXT_MIN_CHANNEL = 150
+_TEXT_MAX_SATURATION = 70
+
+
+@dataclass(frozen=True)
+class CaptionLayout:
+    """Dark caption box and the tight glyph bounds of each text line inside it."""
+
+    box: Box
+    lines: tuple[Box, ...]
+
+
+@dataclass(frozen=True)
+class CaptionReference:
+    """Batch-wide caption box, stored as fractions of the image size.
+
+    Every image in a batch carries the caption in the same place, so the box is
+    voted once over several images and reused; only the text lines, which are
+    trivial to find inside a known box, are located per image.
+    """
+
+    fractions: tuple[float, float, float, float]
+
+    def box_for(self, size: tuple[int, int]) -> Box:
+        width, height = size
+        fx1, fy1, fx2, fy2 = self.fractions
+        return (
+            round(fx1 * width),
+            round(fy1 * height),
+            round(fx2 * width),
+            round(fy2 * height),
+        )
+
+
+# Detecting the box in several images and taking the median per side outvotes
+# the occasional photo whose own edges (grass, poles) fool the detector.
+REFERENCE_SAMPLES = 9
+
+
+def _threshold(img: Image.Image, minimum: int) -> Image.Image:
+    return img.point(lambda value: 255 if value > minimum else 0)
+
+
+def _edge_scores(mask: Image.Image, axis: str) -> list[float]:
+    """Share of set pixels per column ("x") or per row ("y") of a binary mask."""
+    width, height = mask.size
+    data = mask.tobytes()
+    if axis == "y":
+        return [
+            (width - data[y * width : (y + 1) * width].count(0)) / width
+            for y in range(height)
+        ]
+    columns = mask.transpose(Image.Transpose.ROTATE_90)
+    col_data = columns.tobytes()
+    scores = [
+        (height - col_data[i * height : (i + 1) * height].count(0)) / height
+        for i in range(width)
+    ]
+    return scores[::-1]
+
+
+def _text_mask(img: Image.Image) -> Image.Image:
+    """White-ish, unsaturated pixels: caption glyphs."""
+    r, g, b = img.split()
+    low = ImageChops.darker(r, ImageChops.darker(g, b))
+    high = ImageChops.lighter(r, ImageChops.lighter(g, b))
+    bright = _threshold(low, _TEXT_MIN_CHANNEL)
+    neutral = ImageChops.invert(
+        _threshold(ImageChops.subtract(high, low), _TEXT_MAX_SATURATION)
+    )
+    return ImageChops.multiply(bright, neutral)
+
+
+def _longest_runs(mask: Image.Image, max_gap: int) -> list[tuple[int, int]]:
+    """Longest run of set pixels in each row of a binary mask, bridging gaps."""
+    width, height = mask.size
+    data = mask.tobytes()
+    pattern = re.compile(rb"\xff+(?:\x00{1,%d}\xff+)*" % max_gap)
+    runs: list[tuple[int, int]] = []
+    for y in range(height):
+        best = (0, -1)
+        for match in pattern.finditer(data[y * width : (y + 1) * width]):
+            if match.end() - match.start() > best[1] - best[0] + 1:
+                best = (match.start(), match.end() - 1)
+        runs.append(best)
+    return runs
+
+
+def _step(gray: Image.Image, axis: str, *, darker: bool) -> Image.Image:
+    """Pixels darker (or brighter) than the ones 3 px before them."""
+    w, h = gray.size
+    if axis == "x":
+        before, after = gray.crop((0, 0, w - 3, h)), gray.crop((3, 0, w, h))
+    else:
+        before, after = gray.crop((0, 0, w, h - 3)), gray.crop((0, 3, w, h))
+    difference = (
+        ImageChops.subtract(before, after) if darker else ImageChops.subtract(after, before)
+    )
+    return _threshold(difference, _EDGE_STEP)
+
+
+def detect_caption_box(img: Image.Image) -> Box:
+    """Find the dark caption box in the lower half of the image.
+
+    The box darkens whatever is behind it (solid or translucent), so its left
+    and right sides are long vertical luminance steps spanning the same rows,
+    and its top is the row where the whole width darkens at once.
+    """
+    gray = img.convert("L")
+    width, height = gray.size
+    top_limit = height // 2
+    lower = gray.crop((0, top_limit, width, height))
+    lw, lh = lower.size
+
+    # Columns become rows so each side is scanned as one byte string.
+    left_runs = _longest_runs(
+        _step(lower, "x", darker=True).transpose(Image.Transpose.TRANSPOSE), max_gap=3
+    )
+    right_runs = _longest_runs(
+        _step(lower, "x", darker=False).transpose(Image.Transpose.TRANSPOSE), max_gap=3
+    )
+    min_run = max(20, round(height * _MIN_BOX_HEIGHT))
+    half = len(left_runs) // 2
+
+    def long_enough(run: tuple[int, int]) -> bool:
+        return run[1] - run[0] + 1 >= min_run
+
+    lefts = [(x, run) for x, run in enumerate(left_runs[:half]) if long_enough(run)]
+    rights = [
+        (x, run)
+        for x, run in enumerate(right_runs[half:], start=half)
+        if long_enough(run)
+    ]
+    # Both sides of the box start and end on the same rows; reward overlap and
+    # penalize mismatched ends so a pole reaching the bottom cannot win.
+    best: Optional[tuple[int, int]] = None
+    best_score = 0
+    for left_x, left_run in lefts:
+        for right_x, right_run in rights:
+            overlap = min(left_run[1], right_run[1]) - max(left_run[0], right_run[0]) + 1
+            if overlap < min_run:
+                continue
+            union = max(left_run[1], right_run[1]) - min(left_run[0], right_run[0]) + 1
+            score = 2 * overlap - union
+            if best is None or score > best_score:
+                best_score = score
+                best = (left_x, right_x)
+    if best is None:
+        raise RuntimeError("Não foi possível localizar a caixa da legenda")
+    # Step pixels sit between columns i and i + 3; the box starts at i + 2.
+    x1, x2 = best[0] + 2, best[1] + 1
+
+    inside = lower.crop((x1, 0, x2, lh))
+    top_scores = _edge_scores(_step(inside, "y", darker=True), "y")
+    top_index = max(range(len(top_scores)), key=top_scores.__getitem__)
+    if top_scores[top_index] < _MIN_TOP_EDGE_SCORE:
+        raise RuntimeError("Não foi possível localizar a caixa da legenda")
+
+    # A box that stops above the image edge ends in a step as strong as its top.
+    bottom_scores = _edge_scores(_step(inside, "y", darker=False), "y")
+    y2 = height
+    below = range(top_index + min_run, len(bottom_scores))
+    if below:
+        bottom_index = max(below, key=bottom_scores.__getitem__)
+        if bottom_scores[bottom_index] >= top_scores[top_index] * 0.9:
+            y2 = top_limit + bottom_index + 2
+    return (x1, top_limit + top_index + 2, x2, y2)
+
+
+def _runs(flags: list[bool], max_gap: int) -> list[list[int]]:
+    runs: list[list[int]] = []
+    start: Optional[int] = None
+    for index, flag in enumerate(flags + [False]):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if runs and start - runs[-1][1] - 1 <= max_gap:
+                runs[-1][1] = index - 1
+            else:
+                runs.append([start, index - 1])
+            start = None
+    return runs
+
+
+def _refine_box(img: Image.Image, guess: Box) -> Box:
+    """Snap each side of a batch box to this image's own edge, searching nearby.
+
+    Inside a small window the box edge is by far the strongest straight step,
+    so the local search is reliable even where a full-image search is not.
+    """
+    gray = img.convert("L")
+    width, height = gray.size
+    reach = max(6, round(width * 0.02))
+    x1, y1, x2, y2 = guess
+    rows = (max(0, y1 + reach), min(height, y2))
+    cols = (max(0, x1 + reach), min(width, x2 - reach))
+    if rows[1] - rows[0] < 10 or cols[1] - cols[0] < 10:
+        return guess
+    guess_width = x2 - x1
+
+    def best(scores: list[float], start: int, low: int, high: int) -> Optional[int]:
+        window = [i for i in range(low - start, high - start + 1) if 0 <= i < len(scores)]
+        if not window:
+            return None
+        index = max(window, key=scores.__getitem__)
+        return index + start if scores[index] >= 0.3 else None
+
+    band = gray.crop((0, rows[0], width, rows[1]))
+    left = best(_edge_scores(_step(band, "x", darker=True), "x"), 0, x1 - 2 - reach, x1 - 2 + reach)
+    right = best(_edge_scores(_step(band, "x", darker=False), "x"), 0, x2 - 1 - reach, x2 - 1 + reach)
+    new_x1 = left + 2 if left is not None else x1
+    new_x2 = right + 1 if right is not None else x2
+    strip = gray.crop((max(0, new_x1 + reach), 0, min(width, new_x2 - reach), height))
+    top = best(_edge_scores(_step(strip, "y", darker=True), "y"), 0, y1 - 2 - reach, y1 - 2 + reach)
+    new_y1 = top + 2 if top is not None else y1
+    if new_x2 - new_x1 < guess_width * 0.8 or new_y1 >= y2:
+        return guess
+    return (new_x1, new_y1, new_x2, y2)
+
+
+def detect_caption_reference(
+    paths: Iterable[Path], samples: int = REFERENCE_SAMPLES
+) -> CaptionReference:
+    """Vote the caption box over up to ``samples`` images spread over the batch."""
+    files = list(paths)
+    if not files:
+        raise ValueError("Nenhuma imagem para localizar a legenda")
+    count = min(samples, len(files))
+    indices = sorted({round(i * (len(files) - 1) / max(1, count - 1)) for i in range(count)})
+    found: list[tuple[float, float, float, float]] = []
+    last_error: Optional[Exception] = None
+    for index in indices:
+        try:
+            with Image.open(files[index]) as source:
+                img = source.convert("RGB")
+            x1, y1, x2, y2 = detect_caption_box(img)
+        except Exception as exc:
+            last_error = exc
+            continue
+        width, height = img.size
+        found.append((x1 / width, y1 / height, x2 / width, y2 / height))
+    if not found:
+        raise RuntimeError(
+            str(last_error) if last_error else "Não foi possível localizar a caixa da legenda"
+        )
+    medians = tuple(sorted(side)[len(side) // 2] for side in zip(*found))
+    return CaptionReference(medians)  # type: ignore[arg-type]
+
+
+def detect_caption_layout(
+    img: Image.Image, reference: Optional[CaptionReference] = None
+) -> CaptionLayout:
+    """Locate the caption box and every text line, pixel-exact.
+
+    With a batch ``reference`` the box comes from it and only the lines are
+    searched, which keeps hard backgrounds from moving the box.
+    """
+    img = img.convert("RGB")
+    box = (
+        _refine_box(img, reference.box_for(img.size))
+        if reference
+        else detect_caption_box(img)
+    )
+    x1, y1, x2, y2 = box
+    inset = 3
+    if x2 - x1 <= 2 * inset + 6 or y2 - y1 < 6:
+        raise RuntimeError("Não foi possível localizar a caixa da legenda")
+    area = (x1 + inset, y1, x2 - inset, y2)
+    mask = _text_mask(img.crop(area))
+    mw, mh = mask.size
+    data = mask.tobytes()
+    row_counts = [mw - data[y * mw : (y + 1) * mw].count(0) for y in range(mh)]
+    min_height = max(6, round(img.height * 0.004))
+    lines: list[Box] = []
+    for top, bottom in _runs([count >= 2 for count in row_counts], max_gap=3):
+        if bottom - top + 1 < min_height:
+            continue
+        band = mask.crop((0, top, mw, bottom + 1))
+        columns = _edge_scores(band, "x")
+        active = [x for x, share in enumerate(columns) if share > 0]
+        if not active:
+            continue
+        lines.append(
+            (
+                area[0] + min(active),
+                area[1] + top,
+                area[0] + max(active) + 1,
+                area[1] + bottom + 1,
+            )
+        )
+    if not lines:
+        raise RuntimeError("Nenhuma linha de texto foi encontrada na legenda")
+    return CaptionLayout(box=box, lines=tuple(lines))
+
+
+def _ocr_line(img: Image.Image, line: Box) -> str:
+    pad = 6
+    x1, y1, x2, y2 = line
+    crop = img.crop((x1 - pad, y1 - pad, x2 + pad, y2 + pad)).convert("L")
+    crop = ImageChops.invert(crop)
+    text = pytesseract.image_to_string(crop, config="--psm 7").strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def read_caption_lines(
+    img: Image.Image, layout: Optional[CaptionLayout] = None
+) -> list[str]:
+    """OCR every caption line. Unreadable lines come back as empty strings."""
+    img = img.convert("RGB")
+    layout = layout or detect_caption_layout(img)
+    texts: list[str] = []
+    for line in layout.lines:
+        try:
+            texts.append(_ocr_line(img, line))
+        except Exception:
+            texts.append("")
+    return texts
+
+
+def erase_caption_line(img: Image.Image, line: Box, box: Box) -> None:
+    """Remove glyph pixels and rebuild the (possibly translucent) background.
+
+    Only the letters are replaced, filled from the surrounding box pixels, so
+    photo texture showing through a translucent box survives.
+    """
+    pad = 5
+    region = (
+        max(box[0], line[0] - pad),
+        max(box[1], line[1] - pad),
+        min(box[2], line[2] + pad),
+        min(box[3], line[3] + pad),
+    )
+    crop = img.crop(region)
+    # Grow past the anti-aliased edge and the faint dark halo some caption
+    # renderers add, so neither survives as a ghost of the old letters.
+    mask = _threshold(crop.convert("L"), 110).filter(ImageFilter.MaxFilter(7))
+    valid = ImageChops.invert(mask)
+    if valid.getbbox() is None:
+        # No background left to sample (a very light box): use its darkest tone.
+        fill = sample_subtitle_background(crop)
+        img.paste(Image.new("RGB", crop.size, fill), region[:2], mask)
+        return
+    layer = crop.convert("RGBA")
+    layer.putalpha(valid)
+    filled = crop
+    remaining = mask
+    # Normalized convolution: a premultiplied blur fills each hole from the
+    # valid pixels around it. Small radii keep local texture; larger ones only
+    # fill what the smaller ones could not reach.
+    for radius in (2, 4, 8, 16):
+        blurred = (
+            layer.convert("RGBa").filter(ImageFilter.GaussianBlur(radius)).convert("RGBA")
+        )
+        reached = _threshold(blurred.getchannel("A"), 40) if radius < 16 else remaining
+        take = ImageChops.multiply(remaining, reached)
+        filled = Image.composite(blurred.convert("RGB"), filled, take)
+        remaining = ImageChops.subtract(remaining, take)
+        if remaining.getbbox() is None:
+            break
+    img.paste(filled, region[:2])
+
+
+def _text_color(img: Image.Image, line: Box) -> tuple[int, int, int]:
+    crop = img.crop(line).convert("RGB")
+    bright = [pixel for pixel in crop.getdata() if min(pixel) > 200]
+    if not bright:
+        return (255, 255, 255)
+    bright.sort(key=sum)
+    return bright[len(bright) // 2]
+
+
+def fit_line_font_size(reference_text: str, line: Box) -> int:
+    """Font size whose rendering of the original text matches its glyph bounds."""
+    width = line[2] - line[0]
+    height = line[3] - line[1]
+    text = reference_text or "0123456789"
+    best_size = max(8, height)
+    best_score = float("inf")
+    for size in range(max(8, height // 2), height * 2 + 1):
+        # Ink-only bounds, like the measured line (getbbox adds side bearing).
+        bbox = find_font(size).getmask(text).getbbox()
+        if bbox is None:
+            continue
+        text_height = bbox[3] - bbox[1]
+        score = abs(text_height - height) / height
+        if reference_text:
+            score += 0.5 * abs((bbox[2] - bbox[0]) - width) / width
+        if score < best_score:
+            best_score = score
+            best_size = size
+    return best_size
+
+
+def render_free_line(
+    img: Image.Image,
+    layout: CaptionLayout,
+    line_number: int,
+    text: str,
+    reference_text: str = "",
+) -> None:
+    """Replace caption line ``line_number`` (1-based) with ``text`` in place."""
+    if not 1 <= line_number <= len(layout.lines):
+        raise ValueError(
+            f"A legenda tem {len(layout.lines)} linhas; a linha {line_number} não existe"
+        )
+    line = layout.lines[line_number - 1]
+    box = layout.box
+    font_size = fit_line_font_size(reference_text, line)
+    font = find_font(font_size)
+
+    side_margin = max(4, round((box[2] - box[0]) * 0.01))
+    new_bbox = font.getbbox(text)
+    if new_bbox[2] - new_bbox[0] > box[2] - box[0] - 2 * side_margin:
+        raise ValueError(
+            "O texto é longo demais para esta linha. Encurte-o para continuar."
+        )
+
+    # Keep the original baseline: place the reference text's top at the line top.
+    reference_bbox = font.getbbox(reference_text or "0123456789", anchor="ls")
+    baseline = line[1] - reference_bbox[1]
+    center_x = (line[0] + line[2]) / 2
+    # An off-center line keeps its center, but never pushes text past the box.
+    half_width = (new_bbox[2] - new_bbox[0]) / 2
+    center_x = min(
+        max(center_x, box[0] + side_margin + half_width),
+        box[2] - side_margin - half_width,
+    )
+    color = _text_color(img, line)
+
+    erase_caption_line(img, line, box)
+
+    supersample = 4
+    left, top, right, bottom = box
+    layer = Image.new(
+        "RGBA",
+        ((right - left) * supersample, (bottom - top) * supersample),
+        (0, 0, 0, 0),
+    )
+    # Center the ink (not the advance box) on the original line's ink center.
+    big_font = find_font(font_size * supersample)
+    ink = big_font.getmask(text).getbbox()
+    origin = big_font.getbbox(text, anchor="ls")[0]
+    ink_center = origin + ((ink[0] + ink[2]) / 2 if ink else 0)
+    ImageDraw.Draw(layer).text(
+        ((center_x - left) * supersample - ink_center, (baseline - top) * supersample),
+        text,
+        fill=(*color, 255),
+        font=big_font,
+        anchor="ls",
+    )
+    layer = layer.resize((right - left, bottom - top), Image.Resampling.LANCZOS)
+    img.paste(layer, (left, top), layer)
+
+
 def render_edited_image(
     input_path: Path,
     sre_number: int = 10,
     *,
     full_line_text: Optional[str] = None,
+    line_number: Optional[int] = None,
+    caption_reference: Optional[CaptionReference] = None,
+    expected_line_count: Optional[int] = None,
 ) -> Image.Image:
+    """Edit one image.
+
+    With ``line_number`` set (free mode), caption line ``line_number`` (1-based,
+    counted top to bottom) is replaced by ``full_line_text``. Otherwise the
+    legacy third-line edit runs.
+    """
     format_sre_number(sre_number)
     with Image.open(input_path) as source:
         img = source.convert("RGB")
+
+    if line_number is not None:
+        replacement = (full_line_text or "").strip()
+        if not replacement:
+            raise ValueError("Digite o novo texto da linha")
+        if "\n" in replacement or "\r" in replacement:
+            raise ValueError("A linha não pode conter uma quebra de linha")
+        layout = detect_caption_layout(img, caption_reference)
+        if expected_line_count is not None and len(layout.lines) != expected_line_count:
+            # Lines are picked by position, so a different count could mean
+            # replacing the wrong line; refuse instead.
+            raise ValueError(
+                f"A legenda desta imagem tem {len(layout.lines)} linhas, "
+                f"mas a da primeira imagem tem {expected_line_count}"
+            )
+        if not 1 <= line_number <= len(layout.lines):
+            raise ValueError(
+                f"A legenda tem {len(layout.lines)} linhas; "
+                f"a linha {line_number} não existe"
+            )
+        try:
+            reference = _ocr_line(img, layout.lines[line_number - 1])
+        except Exception:
+            reference = ""
+        render_free_line(img, layout, line_number, replacement, reference)
+        return img
 
     if full_line_text is None:
         replacement = read_line_3(img, sre_number)
@@ -436,6 +935,9 @@ def encode_edited_image(
     sre_number: int = 10,
     *,
     full_line_text: Optional[str] = None,
+    line_number: Optional[int] = None,
+    caption_reference: Optional[CaptionReference] = None,
+    expected_line_count: Optional[int] = None,
     output_suffix: Optional[str] = None,
 ) -> bytes:
     """Render and encode one image for both previews and batch output."""
@@ -443,6 +945,9 @@ def encode_edited_image(
         input_path,
         sre_number,
         full_line_text=full_line_text,
+        line_number=line_number,
+        caption_reference=caption_reference,
+        expected_line_count=expected_line_count,
     )
     suffix = (output_suffix or input_path.suffix).lower()
     formats = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
@@ -461,11 +966,17 @@ def edit_image(
     sre_number: int = 10,
     *,
     full_line_text: Optional[str] = None,
+    line_number: Optional[int] = None,
+    caption_reference: Optional[CaptionReference] = None,
+    expected_line_count: Optional[int] = None,
 ) -> None:
     encoded = encode_edited_image(
         input_path,
         sre_number,
         full_line_text=full_line_text,
+        line_number=line_number,
+        caption_reference=caption_reference,
+        expected_line_count=expected_line_count,
         output_suffix=output_path.suffix,
     )
 
